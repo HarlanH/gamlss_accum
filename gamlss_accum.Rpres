@@ -1,0 +1,270 @@
+Forecasting Periodic Accumulating Processes with Semiparametric Regression Models and Bayesian Updates*
+========================================================
+author: Harlan D. Harris, PhD (Director of Data Science, WeWork)
+date: NY Open Statistical Programming Meetup, May 2017
+autosize: true
+
+ \* AKA, "Cancelling Classes for Fun and Profit"
+
+```{r setup, include=FALSE}
+options(stringsAsFactors = FALSE)
+
+library(tidyverse)
+library(gamlss)
+library(knitr)
+library(lubridate)
+library(forecast)
+library(magrittr)
+
+opts_chunk$set(cache=FALSE)
+
+
+```
+
+Problem 1: Forecasting Class Size
+========================================================
+
+![Cancel Decision Illustration](prob1.png)
+
+![Kaplan Test Prep](ktp.png)
+
+***
+
+* Half of test prep classes cancelled before they run (5 years ago).
+* _Will class SAT482 reach profitability cutoff of 10 students?_
+* Early warning to minimize impact on students, faculty, facilities.
+* Impossible to predict in advance (very small Ns, dynamic market).
+* Need to extrapolate, smartly.
+
+Problem 2: Forecasting Monthly Sales
+=====================================
+
+![Monthly Sales Illustration](prob2.png)
+
+![WeWork](wework.png)
+
+***
+
+* Business metric is monthly sales -- need _current_ and subsequent 3 months.
+* _Will we meet our target of 400 sales next month?_
+* On April 15th, we know a lot more about April sales than we did 2 weeks earlier, and probably more about May sales too.
+* Next to extrapolate and update our forecasts, smartly.
+
+Sales Data (Obfuscated!)
+================
+
+```{r data, include=FALSE}
+dat <- read_csv("obfuscated_sales.csv", 
+                col_types = list(col_date("%m/%d/%Y"), 
+                                 col_integer())) %>%
+  complete(sales_date=seq.Date(as.Date("2014-02-01"), 
+                               max(sales_date), 
+                               by="day"),
+           fill=list(n=0))
+
+```
+
+```{r plot_data, echo=FALSE}
+ggplot(dat, aes(sales_date, n)) + geom_point() 
+
+ggplot(dat, aes(day(sales_date), n)) + geom_point() + stat_smooth(method='loess', span=.1)
+```
+
+* Observations: weekly, trend, day-of-month, noisy
+
+Auto-regressive Models
+======================
+
+$$ \text{put formula here} $$
+
+```{r ar}
+monthly <- dat %>% 
+  mutate(sales_month=floor_date(sales_date, "month")) %>%
+  group_by(sales_month) %>%
+  summarise(n=sum(n))
+monthly_ts <- ts(monthly$n, start=c(2014,2), frequency=12)
+```
+
+***
+
+```{r ar_plot}
+autoplot(forecast(auto.arima(monthly_ts), 4)) +
+  scale_y_continuous("Sales", limits=c(0,NA))
+
+```
+
+Prophet
+========
+
+$$ log(y) = s(time) + seasonality + holiday + changepoints + error$$
+
+* Facebook's open-sourced time-series forecasting framework.
+* Does not model time as a _sequence_, but as a covariate. Can incorporate complex seasonality.
+* Doesn't need clockwork periods. Can accept other covariates.
+* Bayesian formulation, implemented in STAN.
+* GAM-like (next!)
+
+
+add a graph?
+
+Generalized Additive Models
+===========================
+
+find someone's nice, simple presentation of this
+
+Accumulating Processes
+======================
+
+
+GAMLSS
+======
+
+* Generalized Additive Models for Location, Scale, & Shape
+* GAM = GLM extension supporting semi-parametric splines, etc.
+* LSS = Independently model all parameters of a distribution
+* Arbitrary exponential-family distributions, e.g., Skew $t$, 
+Box-Cox $t$, Zero-Inflated Poisson, Beta, dozens more...
+
+*** 
+
+* Sales is a smooth function of time & season
+* Var(Sales) is a linear function of time
+* Forecast shape of uncertainty in new cases
+
+Modeling the Prior
+==================
+
+```{r prior, echo=TRUE}
+monthly %<>% 
+  mutate(moy = factor(ifelse(month(sales_month) == 1, "January",
+                      ifelse(month(sales_month) == 12, "December", "Other"))))
+
+prior_fit <- gamlss(log(n) ~ cs(sales_month) + moy,
+                    sigma.formula = ~ sales_month,
+                    nu.formula = ~ sales_month,
+                    family=TF,
+                    data=monthly,
+                    control=gamlss.control(trace=FALSE))
+
+
+```
+
+***
+
+```{r prior_plots, echo=FALSE, fig.height=5, fig.width=5}
+term.plot(prior_fit, terms = 1)
+term.plot(prior_fit, terms = 2)
+term.plot(prior_fit, what='sigma')
+term.plot(prior_fit, what='nu')
+
+```
+
+Prior Fit
+=========
+
+```{r prior_fit}
+preds <- with(predictAll(prior_fit),
+               map_df(c(.05, .5, .95),
+                      ~ data_frame(quantile=sprintf("q%0d", 100*.x), 
+                                   sales_month=monthly$sales_month,
+                                   sales=exp(qTF(.x, mu=mu, 
+                                                 sigma=sigma, nu=nu))))) %>%
+  spread(quantile, sales)
+head(preds)
+
+```
+
+***
+
+```{r prior_fit_plot, echo=FALSE}
+ggplot(preds, aes(sales_month, ymin=q5, ymax=q95, y=q50)) +
+  geom_ribbon(alpha=.5) + geom_line() + 
+  geom_point(data=monthly, mapping=aes(y=n, ymin=NULL, ymax=NULL), color='blue') +
+  xlab("") + scale_y_continuous("Sales", limits=c(0,NA))
+```
+
+
+Modeling the Timecourse
+=======================
+
+* _Proportion of monthly sales_ as a function of proportion of
+month in days, business days
+* As of the beginning of each day, so predictors can be zero, not one
+* Zero-inflated Beta is in $[0, 1)$, 3 parameters.
+
+***
+
+```{r timecourse}
+daily <- dat %>%
+  mutate(sales_month=floor_date(sales_date, "month")) %>%
+  group_by(sales_month) %>%
+  mutate(monthly_sales=sum(n),
+         bod_n=lag(n, default = 0),
+         prop_sales = cumsum(bod_n) / monthly_sales,
+         prop_month=(day(sales_date)-1) / days_in_month(sales_date),
+         prop_bizdays=1) # TODO! 
+
+```
+```{r timecourse_plot}
+ggplot(daily, aes(prop_month, prop_sales, color=sales_date)) + 
+  geom_point() +
+  stat_smooth(aes(color=NULL), method='loess', color='red', span=.1) +
+  scale_x_continuous("Proportion of Month", labels = scales::percent) +
+  scale_y_continuous("Proportion of Sales", labels = scales::percent) +
+  coord_equal()
+
+```
+
+Modeling the Timecourse (cont)
+==============================
+
+```{r timecourse_mod}
+timecourse_fit <- gamlss(prop_sales ~ cs(prop_month),
+                         sigma.formula = ~ cs(prop_month),
+                         nu.formula = ~ cs(prop_month),
+                         data=daily,
+                         family=BEINF0)
+
+# get this in somehow!
+pdf.plot(timecourse_fit, c(1, 15, 28), min=0, max=.99, step=.01)
+
+daily_preds <- with(predictAll(timecourse_fit,
+                               newdata=data_frame(prop_month=(0:99)/100)),
+               map_df(c(.05, .5, .95),
+                      ~ data_frame(quantile=sprintf("q%0d", 100*.x), 
+                                   prop_month=(0:99)/100,
+                                   prop_sales=qBEINF0(.x, mu=mu, 
+                                                 sigma=sigma, nu=nu)))) %>%
+  spread(quantile, prop_sales)
+head(daily_preds)
+```
+
+```{r timecourse_mod_plot}
+ggplot(daily_preds, aes(prop_month, ymin=q5, ymax=q95, y=q50)) + 
+  geom_ribbon(alpha=.5) + 
+  geom_line() +
+  geom_point(data=daily, mapping=aes(ymin=NULL, ymax=NULL, y=prop_sales),
+             color='blue', size=.5) +
+  scale_x_continuous("Proportion of Month", labels = scales::percent) +
+  scale_y_continuous("Proportion of Sales", labels = scales::percent) +
+  coord_equal()
+```
+
+Likelihood and Posterior, ECDFs
+========================
+
+Visualizing and Backtesting
+==========================
+
+Impact
+======
+
+
+Caveats and Alternatives
+=======================
+
+daily model
+
+Thanks
+======
+
