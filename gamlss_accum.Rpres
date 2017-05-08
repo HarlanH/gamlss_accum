@@ -12,11 +12,8 @@ options(stringsAsFactors = FALSE)
 library(tidyverse)
 library(gamlss)
 library(knitr)
-library(lubridate)
 library(forecast)
 library(magrittr)
-library(timeDate)
-library(bizdays)
 
 opts_chunk$set(cache=FALSE)
 
@@ -56,72 +53,63 @@ Sales Data (Simulated!)
 ================
 
 ```{r simdata}
-# 2 "years" of 12-month, 28-day data
-dpm = 28; n = 2*12*dpm
+# 3 "years" of 12-month, 28-day data
+dpm = 28 
 mo <- function(t) 1 + (t-1) %/% dpm
 dom <- function(t) 1 + (t-1) %% dpm
-dat <- data_frame(t=seq.int(n),
+dat <- data_frame(t=seq.int(3*12*dpm),
                   t_mo=mo(t),
                   t_dom=dom(t),
-                  sales = 100 + t + .002 * t^2
+                  bts=t_mo%%12 == 8,
+                  set=factor(ifelse(t > 33*dpm, "Test", "Train"),
+                             levels=c("Train", "Test")),
+                  sales = (1000 + t + .001 * t^2)/10
                   )
-# add goofy offset
-dat %<>% mutate(sales = sales - (t > 12*dpm) * .001 * t^2)
+# add bts effect
+dat %<>% mutate(sales = sales * (1 + .25 * bts))
 # add dom effect
 dat %<>% mutate(sales = sales * (1 + .4 * (t_dom/28)^2))
 # add both additive and multiplicitive noise
-dat %<>% mutate(sales = sales * rnorm(n, 1, .1) + 
-                  rnorm(n, 0, 50))
+dat %<>% mutate(sales = sales * rnorm(3*12*dpm, 1, .3) + 
+                  rnorm(3*12*dpm, 0, 30))
 # force to be nonnegative integer
 dat %<>% mutate(sales = pmax(0, round(sales)))
 
-ggplot(dat, aes(t, sales)) + geom_point() + stat_smooth()
 ```
 
+*** 
 
-```{r data, include=FALSE}
-dat <- read_csv("obfuscated_sales.csv", 
-                col_types = list(col_date("%m/%d/%Y"), 
-                                 col_integer())) %>%
-  complete(sales_date=seq.Date(as.Date("2014-02-01"), 
-                               max(sales_date), 
-                               by="day"),
-           fill=list(n=0))
-dat$set <- with(dat,
-                ifelse(sales_date >= floor_date(max(sales_date), "month") %m-% months(1),
-                  "Test", "Training"))
-
+```{r simdata_plot, echo=FALSE}
+ggplot(dat, aes(t, sales)) + 
+  stat_smooth(se=FALSE, size=3) +
+  geom_point(aes(color=set), alpha=.4) +
+  scale_color_manual("", values=c("black", "red"))
 ```
-
-```{r plot_data, echo=FALSE}
-ggplot(dat, aes(sales_date, n, color=set)) + geom_point() +
-  scale_color_manual(values=c("red", "black"))
-
-ggplot(dat, aes(day(sales_date), n)) + geom_point() + stat_smooth(method='loess', span=.1)
-```
-
-* Observations: weekly, trend, day-of-month, noisy
 
 Auto-regressive Models
 ======================
 
-$$ \text{put formula here} $$
+AR(p): $ X_t = c + \sum_{i=1}^p \phi_i X_{t-1} + \epsilon_t $
 
 ```{r ar}
 monthly <- dat %>% 
-  mutate(sales_month=floor_date(sales_date, "month")) %>%
-  group_by(sales_month) %>%
-  summarise(n=sum(n), set=set[[1]])
-monthly_ts <- ts(filter(monthly, set=="Training")$n, 
-                 start=c(2014,2), frequency=12)
+  group_by(t_mo) %>%
+  summarise(sales=sum(sales), set=set[[1]])
+monthly_ts <- ts(filter(monthly, set=="Train")$sales, 
+                 start=c(2014,1), frequency=12)
 ```
 
 ***
 
 ```{r ar_plot}
-autoplot(forecast(auto.arima(monthly_ts), 4)) +
-  scale_y_continuous("Sales", limits=c(0,NA))
-# TODO: add test set values?
+autoplot(forecast(auto.arima(monthly_ts, max.q=0), 3)) +
+  geom_point(aes(time, sales), 
+             data=data_frame(time=2016+(9:11)/12, 
+                             sales=filter(monthly, set=="Test")$sales),
+             color='red') +
+  scale_y_continuous("Sales", limits=c(0,NA)) 
+
+# autoplot(forecast(auto.arima(ts(dat$sales, start=c(2015,1), frequency=12*dpm)),100))
 ```
 
 Prophet
@@ -174,15 +162,13 @@ Modeling the Prior
 
 ```{r prior, echo=TRUE}
 monthly %<>% 
-  mutate(moy = factor(ifelse(month(sales_month) == 1, "January",
-                      ifelse(month(sales_month) == 12, 
-                             "December",
-                             "Other"))))
+  mutate(bts = factor(ifelse((t_mo-1)%%12 == 7, "BTS", "Normal")))
+                      
 
-monthly_training <- filter(monthly, set=="Training")
-prior_fit <- gamlss(log(n) ~ cs(sales_month) + moy,
-                    sigma.formula = ~ sales_month,
-                    nu.formula = ~ sales_month,
+monthly_training <- filter(monthly, set=="Train")
+prior_fit <- gamlss(log(sales) ~ cs(t_mo) + bts,
+                    sigma.formula = ~ t_mo,
+                    nu.formula = ~ t_mo,
                     family=TF,
                     data=monthly_training,
                     control=gamlss.control(trace=FALSE))
@@ -208,7 +194,7 @@ Prior Fit
 preds <- with(predictAll(prior_fit),
                map_df(c(.05, .5, .95),
                       ~ data_frame(quantile=sprintf("q%0d", 100*.x), 
-                                   sales_month=monthly_training$sales_month,
+                                   t_mo=monthly_training$t_mo,
                                    sales=exp(qTF(.x, mu=mu, 
                                                  sigma=sigma, nu=nu))))) %>%
   spread(quantile, sales)
@@ -220,54 +206,30 @@ Prior Fit
 =========
 
 ```{r prior_fit_plot, echo=TRUE}
-ggplot(preds, aes(sales_month, ymin=q5, ymax=q95, y=q50)) +
+ggplot(preds, aes(t_mo, ymin=q5, ymax=q95, y=q50)) +
   geom_ribbon(alpha=.5) + geom_line() + 
-  geom_point(data=monthly, mapping=aes(y=n, ymin=NULL, ymax=NULL, color=set)) +
+  geom_point(data=monthly, mapping=aes(y=sales, ymin=NULL, ymax=NULL, color=set)) +
   xlab("") + scale_y_continuous("Sales", limits=c(0,NA)) +
   scale_color_manual("", values=c("red", "black"))
 ```
 
-Bizdays
-=======
-
-```{r bizdays}
-
-cal <- create.calendar(holidays=as.Date(holidayNYSE(2010:2020)),
-                       weekdays=c("saturday", "sunday"), 
-                       name="US")
-
-#' Fraction of a month *complete*, in business days, as of the beginning of the current day
-frac_bizdays <- function(dd) {
-  dd <- as.Date(dd)
-  prev_eom <- floor_date(dd, "month") - days(1)
-  next_eom <- ceiling_date(dd, "month", change_on_boundary=TRUE)-days(1)
-  so_far <- bizdays(prev_eom, dd - days(1), cal=cal) 
-  month_tot <- bizdays(prev_eom, next_eom, cal=cal)
-  so_far / month_tot
-}
-
-stopifnot(frac_bizdays('2016-07-29') < 1)
-stopifnot(frac_bizdays('2016-07-31') == 1)
-stopifnot(frac_bizdays('2016-07-01') == 0)
-```
 
 Modeling the Timecourse
 =======================
 
 * _Proportion of monthly sales_ as a function of proportion of
-month in days, business days
+month in days
 * As of the beginning of each day, so predictors can be zero but not one
 * Zero-inflated Beta is in $[0, 1)$, 3 parameters.
 
 ```{r timecourse}
 daily <- dat %>%
-  mutate(sales_month=floor_date(sales_date, "month")) %>%
-  group_by(sales_month) %>%
-  mutate(monthly_sales=sum(n),
-         bod_n=lag(n, default = 0),
-         prop_sales = cumsum(bod_n) / monthly_sales,
-         prop_month=(day(sales_date)-1) / days_in_month(sales_date),
-         prop_bizdays=frac_bizdays(sales_date)) 
+  group_by(t_mo) %>%
+  mutate(monthly_sales=sum(sales),
+         bod_sales=lag(sales, default = 0),
+         prop_sales = cumsum(bod_sales) / monthly_sales,
+         prop_month=(t_dom-1) / dpm) %>% ungroup()
+head(daily)
 
 ```
 
@@ -275,17 +237,10 @@ Days and Business Days
 ======================
 
 ```{r timecourse_plot}
-ggplot(daily, aes(prop_month, prop_sales, color=sales_date)) + 
+ggplot(daily, aes(prop_month, prop_sales, color=t_mo)) + 
   geom_point() +
-  stat_smooth(aes(color=NULL), method='loess', color='red', span=.1) +
+  stat_smooth(aes(color=NULL), color='red') +
   scale_x_continuous("Proportion of Month", labels = scales::percent) +
-  scale_y_continuous("Proportion of Sales", labels = scales::percent) +
-  coord_equal()
-
-ggplot(daily, aes(prop_bizdays, prop_sales, color=sales_date)) + 
-  geom_point() +
-  stat_smooth(aes(color=NULL), method='loess', color='red', span=.1) +
-  scale_x_continuous("Proportion of Business Days", labels = scales::percent) +
   scale_y_continuous("Proportion of Sales", labels = scales::percent) +
   coord_equal()
 
@@ -296,7 +251,7 @@ Modeling the Timecourse (cont)
 ==============================
 
 ```{r timecourse_mod}
-daily_training <- filter(daily, set=="Training")
+daily_training <- filter(daily, set=="Train")
 timecourse_fit <- gamlss(prop_sales ~ cs(prop_month),
                          sigma.formula = ~ cs(prop_month),
                          nu.formula = ~ cs(prop_month),
