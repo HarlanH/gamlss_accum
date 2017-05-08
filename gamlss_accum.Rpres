@@ -213,6 +213,28 @@ ggplot(preds, aes(t_mo, ymin=q5, ymax=q95, y=q50)) +
   scale_color_manual("", values=c("red", "black"))
 ```
 
+Likelihood and Posterior, ECDFs
+========================
+
+* Prior = estimated monthly sales
+* Likelihood = P(observing sales to date | prior, proportion of month)
+* Posterior $\prop$ Prior * Likelihood
+
+$$
+P(\text{forecast sales}=y|\text{sales to date}=x) \propto P(\text{sales to date}=x | \text{fraction of month, forecast sales}=y) 
+\cdot P(\text{forecast sales}=y) \\
+\propto P(\text{fraction sales to date}=\frac{x}{y}|\text{fraction of month}) \cdot P(\text{forecast sales} = y)
+$$
+
+*** 
+
+1. Simulate _distribution_ of proportion of sales under the timecourse model.
+2. For any plausible number of final sales...
+3. Multiply to get simulated distribution of sales (Likelihood).
+4. Convert to ECDF.
+5. Generate ECDF of Prior.
+6. Multiply and normalize to get Posterior.
+
 
 Modeling the Timecourse
 =======================
@@ -265,7 +287,15 @@ pdf.plot(timecourse_fit, c(1, 15, 28), min=0, max=.99, step=.01)
 Modeling the Timecourse (cont)
 ==============================
 
-```{r timecourse_mod2}
+Model gives distribution parameters -- can get quantiles from there, e.g.:
+
+```{r timecourse_forecast} 
+# predict 5th percentile of 1/4 & 3/4 of the way through
+with(predictAll(timecourse_fit, newdata=data_frame(prop_month=c(.25, .75))),
+     qBEINF0(.05,  mu=mu, sigma=sigma, nu=nu))
+```
+
+```{r timecourse_mod2, echo=FALSE}
 daily_preds <- with(predictAll(timecourse_fit,
                                newdata=data_frame(prop_month=(0:99)/100)),
                map_df(c(.05, .5, .95),
@@ -276,6 +306,8 @@ daily_preds <- with(predictAll(timecourse_fit,
   spread(quantile, prop_sales)
 head(daily_preds)
 ```
+
+***
 
 ```{r timecourse_mod_plot}
 ggplot(daily_preds, aes(prop_month, ymin=q5, ymax=q95, y=q50)) + 
@@ -289,21 +321,24 @@ ggplot(daily_preds, aes(prop_month, ymin=q5, ymax=q95, y=q50)) +
   coord_equal()
 ```
 
-Likelihood and Posterior, ECDFs
-========================
+Updating
+========
 
-* Prior = estimated monthly sales
-* Likelihood = P(observing sales to date | prior, proportion of month)
-* Posterior $\prop$ Prior * Likelihood
+February 10, 2017. 408 sales. Panic??
 
-1. Simulate _distribution_ of proportion of sales under the timecourse model.
-2. For any plausible number of final sales...
-3. Multiply to get simulated distribution of sales (Likelihood).
-4. Convert to ECDF.
-5. Generate ECDF of Prior.
-6. Multiply and normalize to get Posterior.
+```{r std}
+fc_day <- filter(daily, sales_month == as.Date("2017-02-01")) %>%
+  mutate(bod_n_cumul = cumsum(bod_n)) %>%
+  filter(sales_date == as.Date("2017-02-10"))
 
-TODO: Review against real code, create diagram.
+dSales <- function(sales) {
+  suppressWarnings(
+    with(predictAll(sales1, tt$test[1,], data=tt$train), dTF(log(sales), mu=mu, sigma=sigma, nu=nu))
+  )
+}
+
+prior <- 
+```
 
 Visualizing and Backtesting
 ==========================
