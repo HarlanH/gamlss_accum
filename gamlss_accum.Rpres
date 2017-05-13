@@ -312,7 +312,7 @@ term.plot(prior_fit, what='nu'); title("Shape, t_mo")
 ```
 </center>
 
-Prior Plot
+Prior Computation
 =========
 
 ```{r prior_fit, message=FALSE, warning=FALSE, results='hide'}
@@ -354,137 +354,203 @@ type:section
 </div>
 </center>
 
-Likelihood and Posterior, ECDFs
+Modeling the Likelihood, Conceptually
 ========================
+left: 40%
 
-* Prior = estimated monthly sales
-* Likelihood = P(observing sales to date | prior, proportion of month)
-* Posterior $\prop$ Prior * Likelihood
-
-$$
-P(\text{forecast sales}=y|\text{sales to date}=x) \propto P(\text{sales to date}=x | \text{fraction of month, forecast sales}=y) 
-\cdot P(\text{forecast sales}=y) \\
-\propto P(\text{fraction sales to date}=\frac{x}{y}|\text{fraction of month}) \cdot P(\text{forecast sales} = y)
-$$
-
-*** 
-
-1. Simulate _distribution_ of proportion of sales under the timecourse model.
-2. For any plausible number of final sales...
-3. Multiply to get simulated distribution of sales (Likelihood).
-4. Convert to ECDF.
-5. Generate ECDF of Prior.
-6. Multiply and normalize to get Posterior.
-
-
-Modeling the Timecourse
-=======================
-
-* _Proportion of monthly sales_ as a function of proportion of
-month in days
-* As of the beginning of each day, so predictors can be zero but not one
-* Zero-inflated Beta is in $[0, 1)$, 3 parameters.
-
-```{r timecourse}
-daily <- dat %>%
-  group_by(t_mo) %>%
-  mutate(monthly_sales=sum(sales),
-         bod_sales=lag(sales, default = 0),
-         prop_sales = cumsum(bod_sales) / monthly_sales,
-         prop_month=(t_dom-1) / dpm) %>% ungroup()
-head(daily)
-
-```
-
-Days and Business Days
-======================
-
-```{r timecourse_plot}
-ggplot(daily, aes(prop_month, prop_sales, color=t_mo)) + 
-  geom_point() +
-  stat_smooth(aes(color=NULL), color='red') +
-  scale_x_continuous("Proportion of Month", labels = scales::percent) +
-  scale_y_continuous("Proportion of Sales", labels = scales::percent) +
-  coord_equal()
-
-ggplot(daily, aes(prop_month, prop_sales, group=t_mo, color=set)) + 
-  geom_line() +
-  scale_x_continuous("Proportion of Month", labels = scales::percent) +
-  scale_y_continuous("Proportion of Sales", labels = scales::percent) +
-  scale_color_manual("", values=c("black", "red")) +
-  coord_equal()
-  
-```
-
-
-Modeling the Timecourse (cont)
-==============================
-
-```{r timecourse_mod}
-daily_training <- filter(daily, set=="Train")
-timecourse_fit <- gamlss(prop_sales ~ cs(prop_month),
-                         sigma.formula = ~ cs(prop_month),
-                         nu.formula = ~ cs(prop_month),
-                         data=daily_training,
-                         family=BEINF0)
-
-# get this in somehow!
-pdf.plot(timecourse_fit, c(1, 15, 28), min=0, max=.99, step=.01)
-```
-
-Modeling the Timecourse (cont)
-==============================
-
-Model gives distribution parameters -- can get quantiles from there, e.g.:
-
-```{r timecourse_forecast} 
-# predict 5th percentile of 1/4 & 3/4 of the way through
-with(predictAll(timecourse_fit, newdata=data_frame(prop_month=c(.25, .75))),
-     qBEINF0(.05,  mu=mu, sigma=sigma, nu=nu))
-```
-
-```{r timecourse_mod2, echo=FALSE}
-daily_preds <- with(predictAll(timecourse_fit,
-                               newdata=data_frame(prop_month=(0:99)/100)),
-               map_df(c(.05, .5, .95),
-                      ~ data_frame(quantile=sprintf("q%0d", 100*.x), 
-                                   prop_month=(0:99)/100,
-                                   prop_sales=qBEINF0(.x, mu=mu, 
-                                                 sigma=sigma, nu=nu)))) %>%
-  spread(quantile, prop_sales)
-head(daily_preds)
+```{r likelihood_concept, echo=FALSE, fig.height=3, fig.width=4}
+tibble(month_prop=c(.03, .5, .90)) %>%
+  by_row(~ tibble(sales_prop=(0:99)/100,
+                  d=dBEINF0(sales_prop, mu=.$month_prop,
+                            sigma=.1, nu=.2)),
+         .collate = 'rows') %>%
+  ggplot(aes(sales_prop, d, color=factor(month_prop))) +
+  geom_line(size=1.5) +
+  facet_grid(factor(month_prop) ~ .) +
+  xlab("Sales Proportion") +
+  theme(legend.position = 'none') +
+  ggtitle("Example Month Proportions")
 ```
 
 ***
 
-```{r timecourse_mod_plot}
-ggplot(daily_preds, aes(prop_month, ymin=q5, ymax=q95, y=q50)) + 
-  geom_ribbon(alpha=.5) + 
-  geom_line() +
-  geom_point(data=daily_training, 
-             mapping=aes(ymin=NULL, ymax=NULL, y=prop_sales),
-             color='blue', size=.5) +
-  scale_x_continuous("Proportion of Month", labels = scales::percent) +
-  scale_y_continuous("Proportion of Sales", labels = scales::percent) +
-  coord_equal()
+$$
+P(\text{sales}=y \vert \text{sales to date}=x) \propto \\
+  P(\text{sales to date}=x | \text{frac of month}=z, \text{sales}=y) \cdot \\ P(\text{sales}=y) \\
+\text{or} \\
+P(\text{fraction sales to date}=\frac{x}{y}|\text{fraction of month}=z)
+\cdot \\
+P(\text{sales} = y)
+$$
+
+Modeling the Likelihood
+==============================
+left:45%
+
+```{r timecourse_mod}
+daily_training <- filter(daily, 
+                         set=="Train")
+timecourse_fit <- 
+  gamlss(prop_sales ~ cs(prop_month),
+         sigma.formula = ~ cs(prop_month),
+         nu.formula = ~ cs(prop_month),
+         data=daily_training,
+         family=BEINF0)
 ```
 
-Updating
-========
+***
 
-December 10, 2016. 2820 sales. Panic??
+```{r timecourse_mod_out, echo=FALSE}
+timecourse_fit
+```
 
-```{r std}
-fc_day <- filter(daily, t_mo == 36) %>%
-  mutate(bod_sales_cumul = cumsum(bod_sales)) %>%
-  filter(t_dom == 10)
+Modeling the Likelihood
+==============================
 
-dSales <- function(covars, sales) {
-  suppressWarnings(
-    with(predictAll(prior_fit, covars, data=monthly_training), 
-         dTF(log(sales), mu=mu, sigma=sigma, nu=nu))
-  )
+<center>
+```{r likelihood_plots, echo=FALSE, fig.height=1.9, fig.width=3, dpi=150}
+par(mai=c(.5,.54,.2,.25))
+term.plot(timecourse_fit, what='mu'); title("Loc, cs(prop_month)")
+term.plot(timecourse_fit, what='sigma'); title("Scale, cs(prop_month)")
+term.plot(timecourse_fit, what='nu'); title("Shape, cs(prop_month)")
+
+```
+</center>
+
+Likelihood Computation
+======================
+left:55%
+
+```{r likelihood_fit, message=FALSE, warning=FALSE, results='hide'}
+likelihood_dist <- function(prop_month, sales_to_date,
+                            sales_range=2000:15000) {
+  with(predictAll(timecourse_fit, 
+          newdata=data.frame(prop_month=prop_month)),
+     tibble(prop_sales=pmin(.999, 
+                        sales_to_date / sales_range),
+            sales=sales_range,
+            d=dBEINF0(prop_sales, mu=mu, 
+                      sigma=sigma, nu=nu)) %>%
+       mutate(d=d/sum(d)))
 }
+
+samp_likelihoods <- tibble(prop_month=c(.03, .5, .90),
+                           std=c(200, 3000, 5000)) %>%
+  by_row(~ likelihood_dist(.$prop_month, .$std), 
+         .collate='rows') 
+```
+
+*** 
+
+```{r onelh, echo=FALSE, fig.height=3, fig.width=4}
+samp_likelihoods %>%
+  mutate(label=sprintf("%0.2f / %d", prop_month, std)) %>%
+  ggplot(aes(sales, d, color=label)) + 
+  geom_line(size=1.2) +
+  xlab("Sales") + ylab("") + 
+  facet_grid(label ~ ., scales = "free_y") +
+  theme(legend.position = 'none') +
+  ggtitle("Modeled Likelihoods")
+```
+
+Computing the Posterior
+========================
+
+$$
+\forall y, P(\text{sales}=y \vert \text{sales to date}=x) \propto \\
+  P(\text{sales to date}=x | \text{frac of month}=z, \text{sales}=y) \cdot \\ P(\text{sales}=y) 
+$$
+
+Algorithm:
+
+* For all plausible final sales numbers,
+* Compute the non-normalized _prior_ and _likelihood_ values & multiply,
+* Then normalize so the _posterior_ is a distribution.
+* Read off quantiles as needed.
+
+Scenario
+===============
+
+<h2>
+It's December 10th, 2016. We've seen 4000 sales to date. Will we hit
+our goal of 10,000 sales?
+</h2>
+
+```{r sample_prior, results='hide'}
+sample_prior <- prior_dist(36, FALSE)
+
+sales_mode <- 
+  function(dd) dd$sales[[which.max(dd$d)]]
+sales_thresh <- 
+  function(dd, th=10000) sum(dd$d[dd$sales >= th])
+```
+
+<center><h2>Maybe?</h2></center>
+
+***
+
+```{r sample_prior_plot, echo=FALSE, fig.height=3, fig.width=4}
+sample_prior %>%
+  ggplot(aes(sales, d)) +
+  geom_line(size=1.5) + 
+  geom_vline(xintercept=10000, color='blue') +
+  scale_y_continuous("", labels=NULL) +
+  xlab("Sales") +
+  ggtitle("Prior", paste("Mode = ", sales_mode(sample_prior), 
+                "; P(Sales > 10k) =",
+                round(sales_thresh(sample_prior), digits=3)))
+
+```
+
+Likelihood
+==========
+
+```{r sample_llh, results='hide'}
+sample_llh <- 
+  likelihood_dist(prop_month = 10/28,
+                  sales_to_date = 4000)
+```
+
+<center><h2>Chickens Counted!</h2></center>
+
+***
+
+```{r sample_llh_plot, echo=FALSE, fig.height=3, fig.width=4}
+sample_llh %>%
+  ggplot(aes(sales, d)) +
+  geom_line(size=1.5) + 
+  geom_vline(xintercept=10000, color='blue') +
+  scale_y_continuous("", labels=NULL) +
+  xlab("Sales") +
+  ggtitle("Likelihood", paste("Mode = ", sales_mode(sample_llh), 
+                "; P(Sales > 10k) =",
+                round(sales_thresh(sample_llh), digits=3)))
+
+```
+
+Responsible Bayesians
+=====================
+
+```{r sample_post}
+sample_post <- data_frame(sales=sample_prior$sales,
+                          d=sample_prior$d * sample_llh$d) %>%
+  mutate(d = d/sum(d))
+```
+
+<center><h2>Back to work.</h2></center>
+
+***
+
+```{r sample_post_plot, echo=FALSE, fig.height=3, fig.width=4}
+sample_post %>%
+  ggplot(aes(sales, d)) +
+  geom_line(size=1.5) + 
+  geom_vline(xintercept=10000, color='blue') +
+  scale_y_continuous("", labels=NULL) +
+  xlab("Sales") +
+  ggtitle("Posterior", paste("Mode = ", sales_mode(sample_post), 
+                "; P(Sales > 10k) =",
+                round(sales_thresh(sample_post), digits=3)))
 
 ```
 
