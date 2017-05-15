@@ -426,12 +426,12 @@ likelihood_dist <- function(prop_month, sales_to_date,
                             sales_range=2000:15000) {
   with(predictAll(timecourse_fit, 
           newdata=data.frame(prop_month=prop_month)),
-     tibble(prop_sales=pmin(.999, 
-                        sales_to_date / sales_range),
+     tibble(prop_sales=pmin(1, sales_to_date / sales_range),
             sales=sales_range,
             d=dBEINF0(prop_sales, mu=mu, 
                       sigma=sigma, nu=nu)) %>%
-       mutate(d=d/sum(d)))
+       mutate(d = ifelse(prop_sales >= 1, 0, d),
+              d = d/sum(d)))
 }
 
 samp_likelihoods <- tibble(prop_month=c(.03, .5, .90),
@@ -566,25 +566,75 @@ type:section
 </div>
 </center>
 
-Visualizing and Backtesting
+Updating over Time
 ==========================
 
-Impact
+```{r animation}
+test_month = 34
+anim_prior <- prior_dist(test_month, FALSE)
+anim_daily <- filter(daily, t_mo==test_month) %>%
+  mutate(cumul_bod_sales=cumsum(bod_sales),
+         cumul_sales=cumsum(sales))
+# for each row in daily, generate a row with 5/50/95 quantiles, and plot
+nearest_sales <- function(dd, p) {
+  nearest <- which.min(abs(dd$ecdf - p))
+  dd$sales[[nearest]]
+}
+anim_quantiles <- 
+  anim_daily %>%
+  by_row(~ {
+           llh <- likelihood_dist(prop_month = .$t_dom/28,
+                                  sales_to_date = .$cumul_bod_sales)
+           post <- data_frame(sales=llh$sales,
+                              d=anim_prior$d * llh$d) %>%
+             mutate(d = d/sum(d),
+                    ecdf = cumsum(d))
+           data_frame(q05 = nearest_sales(post, .05),
+                      q50 = nearest_sales(post, .50),
+                      q95 = nearest_sales(post, .95))
+         }, .collate='rows')
+
+ggplot(anim_quantiles, aes(t_dom, q50, ymin=q05, ymax=q95)) + 
+  geom_ribbon(alpha=.5) + 
+  geom_line() + 
+  geom_hline(yintercept=anim_daily$monthly_sales[[1]], color='blue') +
+  geom_point(data=tail(anim_daily, 4), 
+            mapping=aes(I(t_dom+1), cumul_sales, ymin=NULL, ymax=NULL),
+            color='blue') +
+  xlab("Day of Month") +
+  ylab("Sales") +
+  ggtitle("Bayesian Forecast Sales vs Actual", 
+          paste("Test Month", test_month))
+
+
+```
+
+In Practice
 ======
 
+1. Weekends and Holidays
+2. Backtesting
+3. Future Months
+4. Impact
 
-Caveats and Alternatives
+Pros and Cons
 =======================
 
-daily model
+* Prior & Timecourse models can use arbitrary covariates
+* Honest about uncertainty
+* Semi-parametric models are flexibile, make good use of data
 
-Takeaways
+*** 
+
+* Fiddly details in implementation, not OTS
+* Weird timecourse shapes would require trickier modeling
+* Continuous case is hard (but not likely necessary)
+
+Thanks
 ======
 type:section
 
-* Bayesian Update for Accumulation
-* GAMLSS for Flexible Distribution Models
-* Honest Uncertainty
+* Build trust -- calculate and communicate uncertainty.
 
 Harlan D. Harris, PhD <br>
 [Twitter](http://twitter.com/harlanh), 
