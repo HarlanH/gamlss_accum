@@ -37,7 +37,7 @@ height: 720
 
  \* AKA, "Cancelling Classes for Fun and Profit"
  
-<div class="footer">Twitter: @nyhackr, @harlanh</div>
+<div class="footer">Twitter: @nyhackr, #rstatsnyc, @harlanh</div>
 
 ```{r setup, include=FALSE}
 options(stringsAsFactors = FALSE)
@@ -127,6 +127,7 @@ Desiderata
 * Care about _sum_ of high-variance measurements.
 * Grouping is part of data-generating process; not arbitrary.
 * Want updates as time progresses.
+* Have covariates; not pure time-series.
 * Want prediction intervals (honest uncertainty).
 
 Sales Data (Simulated!)
@@ -280,7 +281,7 @@ Prophet
 $$ log(y) = s(time) + seasonality + holiday + changepoints + error$$
 
 <center>
-<img src="prophet.png" alt="Prophet" style="height: 400px;"/>
+<img src="prophet.png" alt="Prophet" style="height: 350px;"/>
 </center>
 
 GAMLSS
