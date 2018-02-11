@@ -1,0 +1,726 @@
+<style>
+.reveal pre code {
+  font-size: 1.5em;
+}
+.footer {
+    color: black; background: #E8E8E8;
+    position: fixed; top: 90%;
+    text-align:center; width:100%;
+}
+.midcenter {
+    position: fixed;
+    top: 50%;
+    left: 50%;
+}
+.reveal h1, .reveal h2, .reveal h3 {
+  word-wrap: normal;
+  hyphens: none;
+}
+.reveal h1 {
+  font-size: 80px
+}
+.slideContent ul {
+  list-style: none;
+  margin: 0 0 .5em 0
+}
+.reveal .slides section .column {
+  top: 3em
+}
+</style>
+
+Forecasting Repeated Accumulating Processes with Semiparametric Regression Models and Bayesian Updates*
+========================================================
+author: Harlan D. Harris, PhD
+date: CSP, February 2018
+width: 1280
+height: 720
+
+ \* AKA, "Cancelling Classes for Fun and Profit"
+ 
+<div class="footer">Twitter: #csp2018, @harlanh</div>
+
+```{r setup, include=FALSE}
+options(stringsAsFactors = FALSE)
+
+library(tidyverse)
+library(gamlss)
+library(knitr)
+library(forecast)
+library(magrittr)
+library(purrrlyr)
+
+opts_chunk$set(cache=TRUE, dpi=150, autodep = TRUE, echo=FALSE)
+
+theme_set(theme_minimal())
+
+set.seed(1)
+
+```
+
+============
+type:section
+
+<center> 
+<div>
+<h1>1. Repeated Accumulating Processes</h1> 
+</div>
+</center>
+
+Problem 1: Forecasting Class Size
+========================================================
+left: 65%
+
+```{r forecasting_class_plot, fig.height=3, fig.width=5, dpi=150}
+data_frame(days=c(-8.13653924223036, -41.2764017452733, -4.97421451108523, -8.69979094900191, 
+-3.51587212830782, -12.1954079083147, -3.37867442829227, -19.4938695016215, 
+-12.9251936185629, -8.32626658678055, -32.7134362144356, -9.06191221624613
+)) %>%
+  ggplot(aes(days)) + 
+  geom_density(fill='grey', adjust=2) +
+  geom_rug() +
+  scale_x_continuous("Days Before Start",
+                     limits=c(NA,0)) +
+  ylab("") +
+  annotate("segment", x = -14, xend = -14, 
+           y = .045, yend = .035,
+           colour="blue", size=1.5,
+           arrow=arrow()) 
+
+```
+
+***
+
+* _Cancel or Run?_
+* Early Warning System
+* Repeated Problem
+* Imprecision, Accumulating Data
+
+Problem 2: Forecasting Monthly Sales
+=====================================
+left: 65%
+
+```{r sales_plot, fig.height=3, fig.width=5, dpi=150}
+data_frame(x=1:100, mon=sort(rep(1:4,25)),
+           y=100+.5*x+.005*(x**1.1)) %>%
+  group_by(mon) %>%
+  mutate(y2=cumsum(y * rnorm(25, mean = 1, sd=.5))) %>%
+  ggplot(aes(x, y2, group=mon)) + 
+  geom_line() +
+  scale_x_continuous("Month",
+                     breaks=c(0,25,50,75,100),
+       labels=1:5) +
+  ylab("Monthly Sales to Date") +
+  annotate("segment", x = 12, xend = 12, 
+           y = 2700, yend = 1700,
+           colour="blue", size=1.5,
+           arrow=arrow()) 
+
+```
+
+***
+
+* _Will We Meet Sales Targets?_
+* Early Warning System
+* Repeated Problem
+* Imprecision, Accumulating Data
+
+Repeated Accumulating Processes
+======================
+
+**Input:**
+
+* _Count_ of rare/noisy events.
+* Groups are part of data-generating process.
+* Covariates, not simple time series.
+
+**Output:**
+
+* Want updates as time progresses.
+* Want prediction intervals (_honest uncertainty_).
+
+Sales Data (Simulated!)
+================
+left: 60%
+
+```{r simdata}
+years = 3; dpm = 28 
+mo <- function(t) 1 + (t-1) %/% dpm
+dom <- function(t) 1 + (t-1) %% dpm
+dat <- tibble(t=seq.int(years*12*dpm),
+              t_mo=mo(t),
+              t_dom=dom(t),
+              bts=t_mo%%12 == 8, # Back to School!
+              set=factor(ifelse(t > 33*dpm, "Test", "Train"),
+                         levels=c("Train", "Test")),
+              sales = 100 + (t/5) + 3 * 
+                      arima.sim(list(order = c(1,1,0), 
+                                     ar = .1), 
+                                n = years*12*dpm - 1))
+# add bts effect
+dat %<>% mutate(sales = sales * (1 + .25 * bts))
+# add dom effect
+dat %<>% mutate(sales = sales * (1 + .4 * (t_dom/28)^2))
+# add both additive and multiplicitive noise
+dat %<>% mutate(sales = sales *
+                rnorm(years*12*dpm, 1, .2) + 
+                rnorm(years*12*dpm, 0, 20))
+# force to be *nonnegative integer*
+dat %<>% mutate(sales = pmax(0, round(sales)))
+
+glimpse(dat, width=39)
+```
+
+* Seasonality: End of Month, Back to School
+* Omitted complexity: Varying days per month, weekends, holidays.
+* Details: https://github.com/HarlanH/gamlss_accum
+
+*** 
+
+```{r simdata_plot, fig.height=3, fig.width=3.5}
+ggplot(dat, aes(t, sales)) + 
+  stat_smooth(se=FALSE, size=3) +
+  geom_point(aes(color=set), alpha=.4) +
+  scale_color_manual("", values=c("black", "red"))
+```
+
+Divide and Conquer
+==================
+
+```{r monthly, include=FALSE}
+monthly <- dat %>% 
+  group_by(t_mo, set, bts) %>%
+  summarise(sales=sum(sales))
+#glimpse(monthly)
+```
+
+```{r daily, include=FALSE}
+daily <- dat %>%
+  group_by(t_mo) %>%
+  mutate(monthly_sales=sum(sales),
+         bod_sales=lag(sales,  default = 0),
+         prop_sales = cumsum(bod_sales) / 
+           monthly_sales,
+         prop_month=(t_dom-1) / dpm) %>%
+  ungroup()
+#glimpse(daily)
+```
+
+```{r prior_graph, echo=FALSE, fig.height=3, fig.width=4}
+ggplot(monthly, aes(t_mo, sales, color=set)) +
+  geom_line() +
+  scale_color_manual("", values=c("black", "red")) +
+  scale_x_continuous("Month", breaks=(1:3)*12) +
+  scale_y_continuous("Sales", limits = c(0,NA)) +
+  ggtitle("Monthly Model (Empirical Prior)") 
+  
+```
+
+***
+
+```{r timecourse_plot1, echo=FALSE, fig.height=3, fig.width=4}
+
+ggplot(daily, aes(prop_month, prop_sales, group=t_mo, color=set)) +
+  geom_line() +
+  scale_color_manual("", values=c("black", "red")) +
+  scale_x_continuous("Prop. of Month") +
+  scale_y_continuous("Prop. Sales to Date", limits = c(0,NA)) +
+  ggtitle("Timecourse Model (part of Likelihood)") 
+```
+
+============
+type:section
+
+<center> 
+<div>
+<h1>1. Repeated Accumulating Processes</h1> 
+<h1>2. Modeling the Prior</h1> 
+</div>
+</center>
+
+Empirical Bayes
+==========
+
+* Empirical Prior = vague estimate of sales, before seeing any data, modeled from history
+* Likelihood = $\forall$ potential final sales $y$, P(observing sales to date | $y$)
+* Posterior = prior updated by sales to date (likelihood)
+
+$$
+\forall y, P(\text{total sales}=y \ \vert\  \text{frac of month}=z, \text{sales to date}=x) \propto \\
+  P(\text{sales to date}=x \ \vert\  \text{frac of month}=z, \text{total sales}=y) \cdot {\bf P(\text{total sales}=y) }
+$$
+
+
+Modeling the Prior, Conceptually
+================================
+
+```{r prior_concep, fig.height=3, fig.width=4}
+tibble(Sales=500:1500, d=dnorm(Sales, mean=1000, sd=100)) %>%
+  ggplot(aes(Sales, d)) + 
+  geom_line() +
+  ylab("") 
+```
+
+***
+
+Location:
+$$ \text{sales} = f(t,x) + N(0, \sigma) $$
+
+plus Scale:
+$$ \text{sales} = f(t,x) + N(0, g(t,x)) $$
+
+plus Shape:
+$$ \text{sales} = f(t,x) + ?(0, g(t,x), h(t,x)) $$
+
+
+Generalized Additive Models
+===========================
+
+"Mathematically speaking, GAM is an additive modeling technique where the impact of the predictive variables is captured through smooth functions which--depending on the underlying patterns in the data--can be nonlinear:"
+
+![GAM](gam.png)
+
+[GAM: The Predictive Modeling Silver Bullet](http://multithreaded.stitchfix.com/blog/2015/07/30/gam/) (Kim Larsen, Stichfix, 2015)
+
+
+GAMLSS
+======
+
+* [Generalized Additive Models for Location, Scale, & Shape](http://gamlss.org) <br> (Stasinopoulos & Rigby, 2007)
+
+<center>
+<img src="gamlss.png" alt="GAMLSS" style="height: 250px;"/>
+</center>
+
+* LSS = _Independently_ model all parameters of a distribution
+* Arbitrary exponential-family distributions, e.g., Skew $t$, Zero-Inflated Poisson, etc.
+* Forecast _shape of uncertainty_ in new cases
+
+Modeling the Prior
+==================
+
+```{r prior}
+monthly_training <- filter(monthly, set=="Train")
+prior_fit <- gamlss(log(sales) ~ cs(t_mo) + bts,
+                    sigma.formula = ~ t_mo, nu.formula = ~ t_mo,
+                    family=TF, data=monthly_training,
+                    control=gamlss.control(trace=FALSE))
+```
+
+```{r prior_fit_out, echo=FALSE}
+prior_fit
+```
+
+
+Modeling the Prior
+==================
+
+<center>
+```{r prior_plots, echo=FALSE, fig.height=1.9, fig.width=3, dpi=150}
+par(mai=c(.5,.54,.2,.25))
+term.plot(prior_fit, terms = 1); title("Loc, cs(t_mo)")
+term.plot(prior_fit, terms = 2); title("Loc, bts")
+term.plot(prior_fit, what='sigma'); title("Scale, t_mo")
+term.plot(prior_fit, what='nu'); title("Shape, t_mo")
+
+```
+</center>
+
+Prior Computation
+=========
+left: 45%
+
+```{r onprior_prep, include=FALSE}
+prior_dist <- function(t_mo, bts, sales_range=2000:15000) {
+  with(predictAll(prior_fit, 
+                  newdata=data.frame(t_mo=t_mo, bts=bts)),
+       data_frame(sales=sales_range,
+              d=dTF(log(sales_range), mu=mu, 
+                    sigma=sigma, nu=nu),
+              t_mo=t_mo, bts=bts) %>%
+         mutate(d=d/sum(d)))
+}
+
+samp_priors <- data_frame(t_mo=c(15,36), 
+                          bts=c(FALSE, TRUE)) %>%
+  by_row(~ prior_dist(.$t_mo, .$bts), 
+         .collate='rows') 
+```
+
+```{r oneprior, echo=FALSE, fig.height=3, fig.width=4.5}
+samp_priors %>%
+  ggplot(aes(sales, d, group=t_mo, color=t_mo)) + 
+  geom_line(size=1.2) +
+  xlab("Sales") + ylab("") + ggtitle("Months 15 & 36") +
+  theme(legend.position = 'none') 
+```
+
+***
+
+<span style="font-size: large">
+```
+# Simplified:
+
+nd <- data.frame(t_mo=c(15,36), 
+                 bts=c(FALSE, TRUE))
+                 
+with(predictAll(fit, newdata=nd),
+     dTF(log(2000:15000), 
+         mu=mu, 
+         sigma=sigma, 
+         nu=nu))
+```
+</span>
+
+============
+type:section
+
+<center> 
+<div>
+<h1>1. Repeated Accumulating Processes</h1> 
+<h1>2. Modeling the Prior</h1> 
+<h1>3. Updating the Prior</h1> 
+</div>
+</center>
+
+Modeling the Likelihood, Conceptually
+========================
+
+$$
+\forall y, P(\text{sales}=y \ \vert\ \text{frac of month}=z, \text{sales to date}=x) \propto \\
+  P(\text{sales to date}=x \ \vert\ \text{frac of month}=z, \text{sales}=y) \cdot P(\text{sales}=y) \\
+\text{or} \\
+{\bf P(\text{fraction sales to date}=\frac{x}{y}|\text{fraction of month}=z)}
+\cdot
+P(\text{sales} = y)
+$$
+
+```{r likelihood_concept, fig.height=2.5, fig.width=4, fig.align="center"}
+tibble(month_prop=c(.03, .5, .90)) %>%
+  by_row(~ tibble(sales_prop=(0:99)/100,
+                  d=dBEINF0(sales_prop, mu=.$month_prop,
+                            sigma=.1, nu=.2)),
+         .collate = 'rows') %>%
+  ggplot(aes(sales_prop, d, color=factor(month_prop))) +
+  geom_line(size=1.5) +
+  facet_grid(factor(month_prop) ~ .) +
+  xlab("Sales Proportion") +
+  theme(legend.position = 'none') +
+  ggtitle("Example Month Proportions (3%, 50%, 90%)")
+```
+
+
+Modeling the Likelihood
+==============================
+
+```{r timecourse_mod}
+daily_training <- filter(daily, 
+                         set=="Train")
+timecourse_fit <- 
+  gamlss(prop_sales ~ cs(prop_month),
+         sigma.formula = ~ cs(prop_month), nu.formula = ~ cs(prop_month),
+         data=daily_training,
+         family=BEINF0, control=gamlss.control(trace=FALSE))
+```
+
+```{r timecourse_mod_out, echo=FALSE}
+timecourse_fit
+```
+
+Modeling the Likelihood
+==============================
+
+<center>
+```{r likelihood_plots, echo=FALSE, fig.height=1.9, fig.width=3, dpi=150}
+par(mai=c(.5,.54,.2,.25))
+term.plot(timecourse_fit, what='mu'); title("Loc, cs(prop_month)")
+term.plot(timecourse_fit, what='sigma'); title("Scale, cs(prop_month)")
+term.plot(timecourse_fit, what='nu'); title("Shape, cs(prop_month)")
+
+```
+</center>
+
+Likelihood Computation
+======================
+
+```{r likelihood_fit, message=FALSE, warning=FALSE, results='hide'}
+likelihood_dist <- function(prop_month, sales_to_date,
+                            sales_range=2000:15000) {
+  with(predictAll(timecourse_fit, 
+          newdata=data.frame(prop_month=prop_month)),
+     tibble(prop_sales=pmin(1, sales_to_date / sales_range),
+            sales=sales_range,
+            d=dBEINF0(prop_sales, mu=mu, 
+                      sigma=sigma, nu=nu)) %>%
+       mutate(d = ifelse(prop_sales >= 1, 0, d),
+              d = d/sum(d)))
+}
+
+
+```
+
+```{r onelh_prep, results='hide'}
+samp_likelihoods <- tibble(prop_month=c(.03, .5, .90),
+                           std=c(200, 3000, 5000)) %>%
+  by_row(~ likelihood_dist(.$prop_month, .$std), 
+         .collate='rows') 
+```
+
+```{r onelh, echo=FALSE, fig.height=4, fig.width=5}
+
+samp_likelihoods %>%
+  mutate(label=sprintf("%0.2f / %d", prop_month, std)) %>%
+  ggplot(aes(sales, d, color=label)) + 
+  geom_line(size=1.2) +
+  xlab("Sales") + ylab("") + 
+  facet_grid(label ~ ., scales = "free_y") +
+  theme(legend.position = 'none') +
+  ggtitle("Modeled Likelihoods", "3% (200), 50% (3000), and 90% (5000)")
+```
+
+Computing the Posterior
+========================
+
+$$
+\forall y, P(\text{sales}=y \vert \text{sales to date}=x) \propto \\
+  P(\text{sales to date}=x | \text{frac of month}=z, \text{sales}=y) \cdot \\ P(\text{sales}=y) 
+$$
+
+Algorithm:
+
+* For all plausible final sales numbers (integers!),
+* Compute the _prior_ and _likelihood_ distributions & multiply,
+* Then normalize so the _posterior_ is a distribution.
+* Plot or compute quantiles as needed.
+
+Scenario -- Prior Only
+===============
+left: 50%
+
+<h2>
+It's December 10th, 2016. We've seen 4000 sales to date. Will we hit
+our goal of 10,000 sales?
+</h2>
+
+```{r sample_prior, results='hide'}
+sample_prior <- prior_dist(36, FALSE)
+
+sales_mode <- 
+  function(dd) dd$sales[[which.max(dd$d)]]
+sales_thresh <- 
+  function(dd, th=10000) sum(dd$d[dd$sales >= th])
+```
+
+* Plug in month 36 to get _Prior_ distribution.
+* Read off mode and probability of meeting/exceeding goal...
+
+<center><h2>Looks bad, boss...</h2></center>
+
+***
+
+```{r sample_prior_plot, echo=FALSE, fig.height=3, fig.width=4}
+sample_prior %>%
+  ggplot(aes(sales, d)) +
+  geom_line(size=1.5) + 
+  geom_vline(xintercept=10000, color='blue') +
+  scale_y_continuous("", labels=NULL) +
+  xlab("Sales") +
+  ggtitle("Prior", paste("Mode = ", sales_mode(sample_prior), 
+                "; P(Sales > 10k) =",
+                round(sales_thresh(sample_prior), digits=3)))
+
+```
+
+Likelihood
+==========
+left: 50%
+
+```{r sample_llh, results='hide'}
+sample_llh <- 
+  likelihood_dist(prop_month = 10/28,
+                  sales_to_date = 4000)
+```
+
+* Plug in proportion of month, sales to month.
+* Read off mode and probability of meeting/exceeding goal...
+
+<center><h2>Chickens Counted!</h2></center>
+
+***
+
+```{r sample_llh_plot, echo=FALSE, fig.height=3, fig.width=4}
+sample_llh %>%
+  ggplot(aes(sales, d)) +
+  geom_line(size=1.5) + 
+  geom_vline(xintercept=10000, color='blue') +
+  scale_y_continuous("", labels=NULL) +
+  xlab("Sales") +
+  ggtitle("Likelihood", paste("Mode = ", sales_mode(sample_llh), 
+                "; P(Sales > 10k) =",
+                round(sales_thresh(sample_llh), digits=3)))
+
+```
+
+Responsible, Sober Bayesians
+=====================
+left:50%
+
+```{r sample_post}
+sample_post <- 
+  data_frame(sales=sample_prior$sales,
+             d=sample_prior$d * sample_llh$d) %>%
+  mutate(d = d/sum(d))
+```
+
+* Combine & normalized previous distributions.
+* Read off mode and probability of meeting/exceeding goal...
+
+<center><h2>Back to work...</h2></center>
+
+***
+
+```{r sample_post_plot, echo=FALSE, fig.height=3, fig.width=4}
+sample_post %>%
+  ggplot(aes(sales, d)) +
+  geom_line(size=1.5) + 
+  geom_vline(xintercept=10000, color='blue') +
+  scale_y_continuous("", labels=NULL) +
+  xlab("Sales") +
+  ggtitle("Posterior", paste("Mode = ", sales_mode(sample_post), 
+                "; P(Sales > 10k) =",
+                round(sales_thresh(sample_post), digits=3)))
+
+```
+
+============
+type:section
+
+<center> 
+<div>
+<h1>1. Repeated Accumulating Processes</h1> 
+<h1>2. Modeling the Prior</h1> 
+<h1>3. Updating the Prior</h1> 
+<h1>4. Step Back</h1> 
+</div>
+</center>
+
+Daily Updating
+==========================
+
+```{r daily_updates, echo=FALSE, results='hide'}
+test_month = 35 
+anim_prior <- prior_dist(test_month, FALSE)
+anim_daily <- filter(daily, t_mo==test_month) %>%
+  mutate(cumul_bod_sales=cumsum(bod_sales),
+         cumul_sales=cumsum(sales))
+# for each row in daily, generate a row with 5/50/95 quantiles, and plot
+nearest_sales <- function(dd, p) {
+  nearest <- which.min(abs(dd$ecdf - p))
+  dd$sales[[nearest]]
+}
+anim_quantiles <- 
+  anim_daily %>%
+  by_row(~ {
+           llh <- likelihood_dist(prop_month = .$t_dom/28,
+                                  sales_to_date = .$cumul_bod_sales)
+           post <- data_frame(sales=llh$sales,
+                              d=anim_prior$d * llh$d) %>%
+             mutate(d = d/sum(d),
+                    ecdf = cumsum(d))
+           data_frame(q05 = nearest_sales(post, .05),
+                      q50 = nearest_sales(post, .50),
+                      q95 = nearest_sales(post, .95))
+         }, .collate='rows')
+```
+
+```{r daily_updates_plot, echo=FALSE, fig.height=4, fig.width=6, fig.align="center"}
+ggplot(anim_quantiles, aes(t_dom, q50, ymin=q05, ymax=q95)) + 
+  geom_ribbon(alpha=.5) + 
+  geom_line() + 
+  geom_hline(yintercept=anim_daily$monthly_sales[[1]], color='blue') +
+  geom_point(data=tail(anim_daily, 5), 
+            mapping=aes(I(t_dom+1), cumul_sales, ymin=NULL, ymax=NULL),
+            color='blue') +
+  xlab("Day of Month") +
+  ylab("Sales") +
+  ggtitle("Bayesian Forecast Sales vs Actual", 
+          paste("Test Month", test_month))
+
+
+```
+
+Impact & UX
+======
+
+* Internal operations tool, in production
+* Stored percentile vector
+* "(2 -- 18) students" --> "(9 -- 11) students"
+
+Pros and Cons
+=======================
+
+* Prior & Timecourse models can use arbitrary covariates
+* Honest about uncertainty
+* Semi-parametric models are flexible, make good use of data
+
+*** 
+
+* Fiddly details in implementation, not OTS
+* Weird timecourse shapes would require trickier modeling
+* Continuous case is harder (but not likely necessary)
+
+Prophet
+========
+
+* Facebook's [open-sourced](https://facebookincubator.github.io/prophet/) time-series Bayesian forecasting framework, implemented in STAN.
+* Time is a covariate; Complex seasonality; Non-clockwork periods. 
+* Non-accumulating.
+
+$$ log(y) = s(time) + seasonality + holiday + changepoints + error$$
+
+<center>
+<img src="prophet.png" alt="Prophet" style="height: 350px;"/>
+</center>
+
+Thanks
+======
+type:section
+
+## Build trust: calculate and communicate uncertainty.
+
+Harlan D. Harris, PhD <br>
+[Twitter](http://twitter.com/harlanh), 
+[Medium](http://medium.com/@harlanh), 
+[GitHub](http://github.com/HarlanH): @harlanh
+
+<span style="font-size: smaller">
+This Presentation on GitHub: https://github.com/HarlanH/gamlss_accum <br>
+I work at WayUp: https://www.wayup.com/profile/Harlan-Harris-7864660d87/
+</span>
+
+
+
+Auto-regressive Models
+======================
+
+$$ X_t = c + \sum_{i=1}^p \phi_i X_{t-1} + \epsilon_t $$
+
+```{r ar}
+monthly_ts <- ts(filter(monthly, 
+                        set=="Train")$sales, 
+                 start=c(2014,1), frequency=12)
+monthly_fc <- forecast(auto.arima(monthly_ts, 
+                                  max.q=0), 3)
+```
+
+***
+
+```{r ar_plot, echo=FALSE}
+p <- autoplot(monthly_fc) +
+  geom_point(aes(time, sales), 
+             data=tibble(time=2016+(9:11)/12, 
+              sales=filter(monthly, set=="Test")$sales),
+             color='red') +
+  scale_y_continuous("Sales", limits=c(0,NA)) +
+  theme_minimal()
+p
+```
